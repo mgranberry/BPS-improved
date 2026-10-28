@@ -7,6 +7,8 @@ election helpers.
 import asyncio
 import math
 
+import numpy as np
+
 import bps
 from bps import calibration as cal_mod
 from conftest import make_hass
@@ -632,3 +634,86 @@ def test_the_weight_radius_override_still_governs_the_weight():
     # Without the override the fit is dragged onto the collapsed receiver.
     assert math.hypot(without[0] - 600.0, without[1] - 500.0) < \
         math.hypot(with_override[0] - 600.0, with_override[1] - 500.0)
+
+
+# --------------------------------------------------------------------------- #
+# Spatial cluster density de-weighting (multi-bulb fixtures)
+# --------------------------------------------------------------------------- #
+def test_spatial_cluster_weights_isolated():
+    # Widely separated receivers (e.g. 10m apart) should each have rho ≈ 1.0, weight ≈ 1.0
+    px = np.array([0.0, 500.0, 1000.0])
+    py = np.array([0.0, 0.0, 0.0])
+    weights, n_eff = bps._spatial_cluster_weights(px, py, cluster_radius_px=50.0)
+    assert np.allclose(weights, 1.0, atol=1e-3)
+    assert abs(n_eff - 3.0) < 1e-3
+
+
+def test_spatial_cluster_weights_colocated():
+    # 4 bulbs in a single fan fixture within 0.3m (15 px at 50 px/m)
+    # should each have weight ≈ 0.25 and sum to ≈ 1.0
+    px = np.array([100.0, 115.0, 100.0, 115.0])
+    py = np.array([100.0, 100.0, 115.0, 115.0])
+    weights, n_eff = bps._spatial_cluster_weights(px, py, cluster_radius_px=50.0)
+    assert np.all(weights < 0.35)
+    assert abs(n_eff - 1.0) < 0.2  # effective anchor count is ~1.0
+    assert abs(np.sum(weights) - 1.0) < 0.2
+
+
+def test_trilaterate_cluster_deweighting_prevents_gravity_bias():
+    # Target truth at (200, 200)
+    truth = (200.0, 200.0)
+    SCALE = 50.0
+    cluster_r = bps.CLUSTER_RADIUS_M * SCALE  # ~37.5 px
+
+    # 3 distinct corners of a room
+    p1 = (50.0, 200.0)
+    p2 = (350.0, 200.0)
+    p3 = (200.0, 50.0)
+
+    # Let corner p1 be a ceiling fan fixture with 4 co-located bulbs.
+    # Suppose corner p1 has an offset/noisy reading that claims tracker is closer to it.
+    fan_bulbs = [
+        (p1[0], p1[1], math.dist(p1, truth)),
+        (p1[0] + 5, p1[1], math.dist(p1, truth)),
+        (p1[0], p1[1] + 5, math.dist(p1, truth)),
+        (p1[0] + 5, p1[1] + 5, math.dist(p1, truth)),
+    ]
+    other_anchors = [
+        (p2[0], p2[1], math.dist(p2, truth)),
+        (p3[0], p3[1], math.dist(p3, truth)),
+    ]
+    # Add a slight noise pull toward p1
+    noisy_fan_bulbs = [(x, y, max(r - 30.0, 1.0)) for (x, y, r) in fan_bulbs]
+    pts = noisy_fan_bulbs + other_anchors
+
+    fit_without = bps.trilaterate(pts)
+    fit_with = bps.trilaterate(pts, cluster_radius=cluster_r)
+
+    assert fit_without is not None and fit_with is not None
+    err_without = math.dist(fit_without, truth)
+    err_with = math.dist(fit_with, truth)
+
+    # Without cluster de-weighting, the 4 bulbs dominate and pull the fit hard toward p1
+    # With cluster de-weighting, the 4 bulbs only have 1x combined weight, keeping the fit closer to truth
+    assert err_with < err_without - 5.0
+
+
+def test_score_floor_fit_cluster_coverage():
+    # 4 bulbs in a single fixture on Floor A
+    scale = 50.0
+    cluster_r = bps.CLUSTER_RADIUS_M * scale
+    fix = (100.0, 100.0)
+    fan_pts = [
+        (100.0, 100.0, 20.0, 1.0),
+        (105.0, 100.0, 20.0, 1.0),
+        (100.0, 105.0, 20.0, 1.0),
+        (105.0, 105.0, 20.0, 1.0),
+    ]
+    conf_raw, _, cov_raw = bps._score_floor_fit(fix, fan_pts, scale)
+    conf_clustered, _, cov_clustered = bps._score_floor_fit(fix, fan_pts, scale, cluster_radius=cluster_r)
+
+    # Raw coverage would be 4 / 5 = 0.8
+    assert abs(cov_raw - 0.8) < 1e-3
+    # Clustered coverage should reflect ~1 effective anchor: ~1 / 5 = 0.2
+    assert cov_clustered < 0.3
+    assert conf_clustered < conf_raw

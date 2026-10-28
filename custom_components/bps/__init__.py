@@ -199,6 +199,11 @@ TRACKER_REF_OFFSET_MAX_DB = 20.0  # +/- range accepted from the panel/API
 # floor's pixel scale.
 MIN_WEIGHT_RADIUS_M = 0.5
 
+# Spatial cluster de-weighting: receivers within this distance (m) share
+# local density weight so co-located clusters (e.g. 4 bulbs in a fan fixture)
+# do not over-weight the fit or floor election compared to lone sensors.
+CLUSTER_RADIUS_M = 0.75
+
 # --- Floor election by hypothesis competition ---------------------------------
 # The floor used to be elected by the single nearest receiver — one noisy
 # reading through a ceiling could steal the tracker for a cycle (kitchen <->
@@ -1272,10 +1277,11 @@ async def update_trilateration_and_zone(hass, new_global_data, entity):
         margin = 0.1 * max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
         floor_bounds = (min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin)
 
-        fix = trilaterate(weighted, bounds=floor_bounds, min_weight_radius=min_wr)
+        cluster_r = CLUSTER_RADIUS_M * scale if scale else None
+        fix = trilaterate(weighted, bounds=floor_bounds, min_weight_radius=min_wr, cluster_radius=cluster_r)
         if fix is None:
             continue  # this floor's readings don't converge; not a contender
-        conf, rms_m, coverage = _score_floor_fit(fix, weighted, scale)
+        conf, rms_m, coverage = _score_floor_fit(fix, weighted, scale, cluster_radius=cluster_r)
         # A fit landing in this floor's no-go zone is physically impossible
         # here (issue #60): down-weight it so the competition prefers the
         # floor where that spot is a real room. Down-weight, not eliminate —
@@ -1567,7 +1573,41 @@ def extract_candidate_floors(new_global_data, tmpentity):
     return candidates
 
 
-def _score_floor_fit(fix, weighted, scale):
+def _spatial_cluster_weights(px, py, cluster_radius_px):
+    """Compute spatial density de-weighting for co-located receiver clusters.
+
+    For N receivers, each receiver's local density rho_i is computed using a
+    Gaussian kernel with characteristic width cluster_radius_px:
+        rho_i = sum_j exp(-dist(p_i, p_j)^2 / (2 * cluster_radius_px^2))
+
+    When a receiver is isolated (no other receivers within cluster_radius_px),
+    rho_i = 1.0 and its weight is 1.0. When K receivers are co-located in a
+    cluster (e.g. 4 bulbs in a ceiling fan fixture), rho_i ≈ K, so scaling
+    their weights by 1/rho_i gives the whole cluster a combined weight of 1.0
+    (equivalent to a single independent anchor).
+
+    Returns:
+        (cluster_weights, n_eff):
+            cluster_weights: 1D np.ndarray of shape (N,) with values in (0, 1]
+            n_eff: effective independent anchor count sum(1/rho_i)
+    """
+    n = len(px)
+    if n == 0:
+        return np.array([], dtype=float), 0.0
+    if not cluster_radius_px or cluster_radius_px <= 0:
+        return np.ones(n, dtype=float), float(n)
+
+    dx = px[:, None] - px[None, :]
+    dy = py[:, None] - py[None, :]
+    d_sq = dx * dx + dy * dy
+    two_sigma_sq = 2.0 * (cluster_radius_px * cluster_radius_px)
+    rho = np.sum(np.exp(-d_sq / two_sigma_sq), axis=1)
+    weights = 1.0 / np.maximum(rho, 1.0)
+    n_eff = float(np.sum(weights))
+    return weights, n_eff
+
+
+def _score_floor_fit(fix, weighted, scale, cluster_radius=None):
     """Score one candidate floor's solve. Returns (confidence, rms_m, coverage).
 
     Confidence blends how well the fix explains ALL of the floor's reporting
@@ -1580,26 +1620,34 @@ def _score_floor_fit(fix, weighted, scale):
     """
     x, y = fix
     n = len(weighted)
+    if cluster_radius and cluster_radius > 0 and n > 0:
+        px = np.fromiter((pt[0] for pt in weighted), dtype=float, count=n)
+        py = np.fromiter((pt[1] for pt in weighted), dtype=float, count=n)
+        cluster_w, n_eff = _spatial_cluster_weights(px, py, cluster_radius)
+    else:
+        cluster_w = np.ones(n, dtype=float)
+        n_eff = float(n)
+
     num = den = 0.0
-    for pt in weighted:  # (x, y, r, w[, slant_px]) — indexed so both shapes work
+    for i, pt in enumerate(weighted):  # (x, y, r, w[, slant_px]) — indexed so both shapes work
         xi, yi, ri, wi = pt[0], pt[1], pt[2], pt[3]
+        eff_w = wi * float(cluster_w[i])
         res = math.hypot(xi - x, yi - y) - ri
-        num += wi * res * res
-        den += wi
+        num += eff_w * res * res
+        den += eff_w
     rms_px = math.sqrt(num / den) if den > 0 else float("inf")
     # Reduced-chi-square-style correction: a 3-receiver floor fits the 2
     # position unknowns almost perfectly no matter what (a single residual
     # degree of freedom), which flatters exactly the floors with the least
     # evidence. Inflate by sqrt(n / (n - 2)) so fits compete on evidence.
-    rms_px *= math.sqrt(n / max(n - 2.0, 1.0))
+    # Uses effective independent anchors n_eff so clustered receivers don't
+    # artificially inflate the degree-of-freedom count.
+    rms_px *= math.sqrt(n_eff / max(n_eff - 2.0, 1.0))
     rms_m = rms_px / scale if scale else rms_px
     quality = 1.0 / (1.0 + (rms_m / FLOOR_RESIDUAL_SCALE_M) ** 2)
-    # Corroboration: how many receivers hear the tracker on this floor,
-    # saturating at COVERAGE_TARGET_N. An absolute count, NOT a share of the
-    # floor's placed receivers: a dead or unmatched placement must not
-    # handicap its floor forever, and a tiny fully-reporting 3-receiver floor
-    # must not out-cover a floor with 6 of 8 receivers reporting.
-    coverage = min(1.0, n / COVERAGE_TARGET_N)
+    # Corroboration: how many independent anchors hear the tracker on this floor,
+    # saturating at COVERAGE_TARGET_N.
+    coverage = min(1.0, n_eff / COVERAGE_TARGET_N)
     return 0.5 * coverage + 0.5 * quality, rms_m, coverage
 
 
@@ -2483,7 +2531,7 @@ class BPSCordsAPI(HomeAssistantView):
 _JAC_MIN_DIST = 1e-9
 
 
-def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
+def trilaterate(known_points, bounds=None, min_weight_radius=1e-3, cluster_radius=None):
     """Weighted least-squares position fit.
 
     known_points are (x, y, r[, w[, wr]]) tuples. The optional w is a per-point
@@ -2495,6 +2543,10 @@ def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
     to the floor cannot buy itself dominant 1/r^2 influence — following the
     4-tuple form with collapsed projected radii reintroduces exactly the 1.7.0
     hijack. min_weight_radius clamps whichever weight radius is in use.
+
+    cluster_radius (px), when given, normalises receiver weights by local
+    spatial density so co-located clusters (e.g. 4 bulbs in one fan fixture)
+    do not over-weight the fit relative to lone sensors.
 
     bounds, when given as (minx, miny, maxx, maxy), constrains the solution to
     the floor's extent: the fit then finds the best position WITHIN the map,
@@ -2529,6 +2581,13 @@ def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
     # the fit snapped onto it (1.7.0 regression).
     wrad = np.fromiter((p[4] if len(p) > 4 else p[2] for p in known_points),
                        dtype=float, count=num_points)
+
+    if cluster_radius and cluster_radius > 0:
+        cluster_w, _ = _spatial_cluster_weights(px, py, cluster_radius)
+        rel = rel * cluster_w
+    else:
+        cluster_w = np.ones(num_points, dtype=float)
+
     # reliability x geometric (1/r^2) weight, pre-rooted: the residual is
     # sqrt(w) * (distance - r), so sqrt() belongs here rather than per call.
     sqrt_w = np.sqrt(rel / np.maximum(wrad, min_weight_radius) ** 2)
@@ -2550,12 +2609,19 @@ def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
         d = np.maximum(np.hypot(dx, dy), _JAC_MIN_DIST)
         return np.column_stack((sqrt_w * dx / d, sqrt_w * dy / d))
 
-    # Start from the receiver centroid: it is always a plausible position,
-    # unlike the map corner, and it must lie inside any given bounds.
-    x0 = np.array([
-        float(np.mean([p[0] for p in known_points])),
-        float(np.mean([p[1] for p in known_points])),
-    ])
+    # Start from the receiver centroid (weighted by spatial cluster density so
+    # a co-located multi-bulb cluster does not bias the initial seed):
+    total_cluster_w = float(np.sum(cluster_w))
+    if total_cluster_w > 0:
+        x0 = np.array([
+            float(np.sum(px * cluster_w) / total_cluster_w),
+            float(np.sum(py * cluster_w) / total_cluster_w),
+        ])
+    else:
+        x0 = np.array([
+            float(np.mean(px)),
+            float(np.mean(py)),
+        ])
     # Robust least squares: soft_l1 down-weights a single spatial outlier so it
     # can't drag the fit. least_squares already defaults to TRF (which supports
     # both bounds and a robust loss), so this only adds the loss and makes the
@@ -2713,6 +2779,7 @@ def run_selftest(hass, samples=None):
             [(px, py, pr, 1.0, psl) for (px, py, pr, psl) in pts],
             bounds=floor_bounds.get(tgt["floor"]),
             min_weight_radius=MIN_WEIGHT_RADIUS_M * tgt["scale"],
+            cluster_radius=CLUSTER_RADIUS_M * tgt["scale"],
         )
         if fix is None:
             unsolved.append({"entity": slug, "floor": tgt["floor"], "heard_by": len(pts), "reason": "no convergence"})
